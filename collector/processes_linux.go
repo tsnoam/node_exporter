@@ -16,6 +16,7 @@
 package collector
 
 import (
+	"container/list"
 	"fmt"
 	"os"
 	"strconv"
@@ -35,6 +36,8 @@ type processCollector struct {
 }
 
 type procResUsage struct {
+	pid     int
+	name    string
 	rss     int
 	vsize   uint
 	cpuTime float64
@@ -71,12 +74,12 @@ func NewProcessStatCollector() (Collector, error) {
 		),
 		perProcUsage: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "usage"),
 			"Per process usage of system resources",
-			[]string{"pid", "resource"}, nil,
+			[]string{"pid", "name", "resource"}, nil,
 		),
 	}, nil
 }
 func (t *processCollector) Update(ch chan<- prometheus.Metric) error {
-	pids, states, threads, pidToUsage, err := getAllocatedThreads()
+	pids, states, threads, usage, err := getAllocatedThreads()
 	if err != nil {
 		return fmt.Errorf("unable to retrieve number of allocated threads: %q", err)
 	}
@@ -92,11 +95,12 @@ func (t *processCollector) Update(ch chan<- prometheus.Metric) error {
 		ch <- prometheus.MustNewConstMetric(t.procsState, prometheus.GaugeValue, float64(states[state]), state)
 	}
 
-	for pid, usage := range pidToUsage {
-		pidStr := strconv.Itoa(pid)
-		ch <- prometheus.MustNewConstMetric(t.perProcUsage, prometheus.GaugeValue, float64(usage.rss), pidStr, "rss")
-		ch <- prometheus.MustNewConstMetric(t.perProcUsage, prometheus.GaugeValue, float64(usage.vsize), pidStr, "vsize")
-		ch <- prometheus.MustNewConstMetric(t.perProcUsage, prometheus.GaugeValue, usage.cpuTime, pidStr, "cpu_time")
+	for e := usage.Front(); e != nil; e = e.Next() {
+		v := e.Value.(procResUsage)
+		pidStr := strconv.Itoa(v.pid)
+		ch <- prometheus.MustNewConstMetric(t.perProcUsage, prometheus.GaugeValue, float64(v.rss), pidStr, v.name, "rss")
+		ch <- prometheus.MustNewConstMetric(t.perProcUsage, prometheus.GaugeValue, float64(v.vsize), pidStr, v.name, "vsize")
+		ch <- prometheus.MustNewConstMetric(t.perProcUsage, prometheus.GaugeValue, v.cpuTime, pidStr, v.name, "cpu_time")
 	}
 
 	pidM, err := readUintFromFile(procFilePath("sys/kernel/pid_max"))
@@ -109,7 +113,7 @@ func (t *processCollector) Update(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
-func getAllocatedThreads() (int, map[string]int32, int, map[int]procResUsage, error) {
+func getAllocatedThreads() (int, map[string]int32, int, *list.List, error) {
 	fs, err := procfs.NewFS(*procPath)
 	if err != nil {
 		return 0, nil, 0, nil, err
@@ -121,7 +125,7 @@ func getAllocatedThreads() (int, map[string]int32, int, map[int]procResUsage, er
 	pids := 0
 	thread := 0
 	procStates := make(map[string]int32)
-	pidToUsage := make(map[int]procResUsage)
+	usage := list.New()
 	for _, pid := range p {
 		stat, err := pid.NewStat()
 		// PIDs can vanish between getting the list and getting stats.
@@ -134,8 +138,8 @@ func getAllocatedThreads() (int, map[string]int32, int, map[int]procResUsage, er
 		}
 		pids++
 		procStates[stat.State]++
-		pidToUsage[pid.PID] = procResUsage{rss: stat.ResidentMemory(), vsize: stat.VirtualMemory(), cpuTime: stat.CPUTime()}
+		usage.PushBack(procResUsage{pid: pid.PID, name: stat.Comm, rss: stat.ResidentMemory(), vsize: stat.VirtualMemory(), cpuTime: stat.CPUTime()})
 		thread += stat.NumThreads
 	}
-	return pids, procStates, thread, pidToUsage, nil
+	return pids, procStates, thread, usage, nil
 }
